@@ -4903,6 +4903,65 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+struct test_concat_ssm_conv : public test_case {
+    const int64_t channels, tokens, seqs;
+    const bool bias, extra_consumer, silu;
+    ggml_tensor * concat = nullptr;
+    ggml_tensor * cpy = nullptr;
+    ggml_tensor * output = nullptr;
+
+    test_concat_ssm_conv(int64_t channels, int64_t tokens, int64_t seqs, bool bias, bool extra_consumer = false, bool silu = true)
+        : channels(channels), tokens(tokens), seqs(seqs), bias(bias), extra_consumer(extra_consumer), silu(silu) {}
+
+    std::string op_desc(ggml_tensor *) override { return "CONCAT_SSM_CONV"; }
+    std::string vars() override { return VARS_TO_STR6(channels, tokens, seqs, bias, extra_consumer, silu); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { concat, cpy, output }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * channels, seqs + 2);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seqs);
+        ggml_set_name(ids, "conv_ids");
+        ggml_tensor * state = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), 3, channels, seqs);
+        ggml_tensor * input = ggml_scale(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, tokens, seqs), 0.5f);
+        concat = ggml_concat(ctx, state, ggml_transpose(ctx, input), 0);
+        ggml_tensor * tail = ggml_view_3d(ctx, concat, 3, channels, seqs, concat->nb[1], concat->nb[2], tokens * sizeof(float));
+        ggml_tensor * cell = ggml_view_2d(ctx, cache, 3 * channels, seqs, cache->nb[1], cache->nb[1]);
+        cpy = ggml_cpy(ctx, tail, cell);
+        ggml_tensor * copied = ggml_sum(ctx, cpy);
+        ggml_tensor * kernel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+        output = ggml_ssm_conv(ctx, concat, kernel);
+        if (bias) {
+            output = ggml_add(ctx, output, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, channels));
+        }
+        if (silu) {
+            output = ggml_silu(ctx, output);
+        }
+        ggml_tensor * result = ggml_add(ctx, ggml_sum(ctx, output), copied);
+        if (extra_consumer) {
+            result = ggml_add(ctx, result, ggml_sum(ctx, ggml_sqr(ctx, concat)));
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "conv_ids") == 0) {
+                std::vector<int32_t> ids(seqs);
+                for (int32_t s = 0; s < seqs; ++s) {
+                    ids[s] = s;
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11770,6 +11829,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    for (int64_t channels : {8192, 67}) {
+        for (int64_t tokens : {1, 4}) {
+            for (int64_t seqs : {1, 2}) {
+                for (bool bias : {false, true}) {
+                    test_cases.emplace_back(new test_concat_ssm_conv(channels, tokens, seqs, bias));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_concat_ssm_conv(67, 1, 2, false, true));
+    test_cases.emplace_back(new test_concat_ssm_conv(67, 4, 2, false, false, false));
+    test_cases.emplace_back(new test_concat_ssm_conv(8192, 1, 1, false, false, false));
 
     for (int64_t d_conv : {2, 3, 4, 7, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {

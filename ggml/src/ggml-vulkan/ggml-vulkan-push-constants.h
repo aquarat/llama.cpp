@@ -810,6 +810,12 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+struct vk_op_concat_ssm_conv_push_constants {
+    uint32_t state_nb1, state_nb2;
+    uint32_t input_nb0, input_nb1, input_nb2;
+    uint32_t channels, tokens, seqs;
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;
