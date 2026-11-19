@@ -813,6 +813,53 @@ def test_completion_checkpoint_kept_after_restore():
         assert cache_n(prefix + suffix) == len(prefix) - 1
 
 
+# the checkpoint at the first user message (end of the system prompt) must survive thinning and eviction in a long chat
+@pytest.mark.parametrize("checkpoint_min_step", [0, 64])
+def test_completion_checkpoint_user_start_kept(checkpoint_min_step):
+    global server
+    server = ServerPreset.tinylfm3omni()
+    server.n_slots = 1
+    server.n_batch = 16
+    server.n_ubatch = 16
+    server.n_ctx_checkpoints = 4
+    server.checkpoint_min_step = checkpoint_min_step
+    server.cache_ram = 0
+    server.jinja = True
+    server.start()
+
+    system = {"role": "system", "content": "You are a helpful assistant. " * 20}
+    res = server.make_request("POST", "/apply-template", data={
+        "messages": [system],
+        "add_generation_prompt": False,
+    })
+    assert res.status_code == 200
+    res = server.make_request("POST", "/tokenize", data={"content": res.body["prompt"], "add_special": True})
+    assert res.status_code == 200
+    n_system = len(res.body["tokens"])
+    assert n_system > server.n_ubatch
+
+    def chat(messages):
+        res = server.make_request("POST", "/v1/chat/completions", data={
+            "messages": messages,
+            "max_tokens": 1,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        return res.body["timings"]["cache_n"]
+
+    messages = [system, {"role": "user", "content": "Hi"}]
+    chat(messages)
+    for _ in range(6):
+        messages.extend([
+            {"role": "assistant", "content": "Hello. How can I help you today?"},
+            {"role": "user", "content": "Tell me a story about a fox in the forest."},
+        ])
+        chat(messages)
+
+    # A new chat must reuse the system prefix after thinning and eviction.
+    assert chat([system, {"role": "user", "content": "Goodbye"}]) >= n_system
+
+
 # hybrid model with SWA: a checkpoint or a state right before the new tokens must be reused, even if it is less than n_swa tokens away
 def test_completion_checkpoint_hybrid_swa():
     global server

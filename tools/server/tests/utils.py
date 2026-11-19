@@ -73,6 +73,8 @@ class ServerProcess:
     n_gpu_layer: int | None = None
     n_batch: int | None = None
     n_ubatch: int | None = None
+    n_ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
     n_ctx: int | None = None
     n_ga: int | None = None
     n_ga_w: int | None = None
@@ -209,6 +211,10 @@ class ServerProcess:
             server_args.extend(["--batch-size", self.n_batch])
         if self.n_ubatch:
             server_args.extend(["--ubatch-size", self.n_ubatch])
+        if self.n_ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.n_ctx_checkpoints])
+        if self.checkpoint_min_step is not None:
+            server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
         if self.n_threads:
             server_args.extend(["--threads", self.n_threads])
         if self.n_gpu_layer:

@@ -2663,35 +2663,58 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+        const auto & spans = slot.task->params.message_spans;
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
+        // prefer user starts when thinning old checkpoints; keep checkpoints from the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        int64_t last = -1;
+        auto prev = slot.prompt.checkpoints.end();
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
-            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            if (prev != slot.prompt.checkpoints.end() && cur.n_tokens <= (*prev)->n_tokens + params_base.checkpoint_min_step) {
+                auto victim = slot.prompt.checkpoints.end();
+                if (spans.is_user_start(cur.n_tokens) && !spans.is_user_start((*prev)->n_tokens) && (*prev)->id_task != id_task) {
+                    victim = prev;
+                } else if (cur.id_task != id_task) {
+                    victim = it;
+                }
+                if (victim != slot.prompt.checkpoints.end()) {
+                    const auto & old = **victim;
+                    SLT_TRC(slot, "erasing context checkpoint too close to another one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                            old.pos_min, old.pos_max, old.n_tokens, (float) old.size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
+                    if (victim == it) {
+                        it = slot.prompt.checkpoints.erase(it);
+                        continue;
+                    }
+                    slot.prompt.checkpoints.erase(victim);
+                }
             }
 
-            last = cur.n_tokens;
+            prev = it;
             ++it;
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = *slot.prompt.checkpoints.front();
+            // erase the oldest checkpoint that is not at a user start, else keep the first user start (end of the system prompt)
+            auto it = slot.prompt.checkpoints.begin();
+            while (it != slot.prompt.checkpoints.end() && spans.is_user_start((*it)->n_tokens)) {
+                ++it;
+            }
+            if (it == slot.prompt.checkpoints.end()) {
+                it = slot.prompt.checkpoints.begin();
+                if (slot.prompt.checkpoints.size() > 1) {
+                    ++it;
+                }
+            }
+            const auto & cur = **it;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
