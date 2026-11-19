@@ -3645,6 +3645,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const std::string suffix = "_" + std::to_string(block_size);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[0][0][i], "rms_norm_f32" + suffix, RMS_SHADER(rms_norm_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[0][1][i], "rms_norm_mul_f32" + suffix, RMS_SHADER(rms_norm_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
+        ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_gate[i], "rms_norm_mul_gate_f32" + suffix, RMS_SHADER(rms_norm_mul_gate_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[1][0][i], "rms_norm_bf16" + suffix, RMS_SHADER(rms_norm_bf16), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[1][1][i], "rms_norm_mul_bf16" + suffix, RMS_SHADER(rms_norm_bf16), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         for (uint32_t pm : {0, 1}) {
@@ -11748,6 +11749,32 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         return;
     }
 
+    if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_GATE) {
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * weight = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+        const ggml_tensor * gate = unary->src[0];
+        ggml_tensor * dst = cgraph->nodes[node_idx + 3];
+        vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, weight, gate, op_params[0], 0);
+        init_pushconst_tensor_offsets(ctx, pc, src0, weight, nullptr, nullptr, dst);
+        pc.ne20 = get_misalign_bytes(ctx, gate) / sizeof(float);
+        pc.param3 = ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID;
+        vk_pipeline pipeline = ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm_mul_gate, src0->ne[0]);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+            ggml_vk_tensor_subbuffer(ctx, src0, true),
+            ggml_vk_tensor_subbuffer(ctx, weight, true),
+            ggml_vk_tensor_subbuffer(ctx, dst, true),
+            ggml_vk_tensor_subbuffer(ctx, gate, true),
+        }, pc, {
+            (uint32_t)src0->ne[1],
+            std::min((uint32_t)src0->ne[2], ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+            std::min((uint32_t)src0->ne[3], ctx->device->properties.limits.maxComputeWorkGroupCount[2]),
+        });
+        ggml_vk_rms_norm_finish(ctx, src0);
+        return;
+    }
+
     if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_ADD || ctx->fused_rms_norm_mode == RMS_NORM_MUL_ADD_MUL) {
         ggml_tensor * mul = cgraph->nodes[node_idx + 1];
         ggml_tensor * add = cgraph->nodes[node_idx + 2];
@@ -15156,6 +15183,48 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
     return false;
 }
 
+static bool ggml_vk_can_fuse_rms_norm_mul_gate(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_can_fuse_subgraph(cgraph, i, rms_norm_mul_gate_pattern, { i + 3 }) || ctx->do_add_rms_partials) {
+        return false;
+    }
+    const ggml_tensor * rms = cgraph->nodes[i];
+    const ggml_tensor * mul = cgraph->nodes[i + 1];
+    const ggml_tensor * unary = cgraph->nodes[i + 2];
+    const ggml_tensor * dst = cgraph->nodes[i + 3];
+    if ((mul->src[0] != rms && mul->src[1] != rms) ||
+        !((dst->src[0] == mul && dst->src[1] == unary) || (dst->src[1] == mul && dst->src[0] == unary))) {
+        return false;
+    }
+    const ggml_unary_op op = ggml_get_unary_op(unary);
+    if (op != GGML_UNARY_OP_SILU && op != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * weight = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const ggml_tensor * gate = unary->src[0];
+    if (weight == rms || gate == rms || gate == mul) {
+        return false;
+    }
+    if (!ggml_is_vector(weight) || weight->ne[0] != x->ne[0] ||
+        !ggml_are_same_shape(x, gate) || !ggml_are_same_shape(x, dst) ||
+        !ggml_is_contiguous(dst) || !ggml_is_contiguous(weight)) {
+        return false;
+    }
+    for (const ggml_tensor * t : { x, weight, gate, rms, mul, unary, dst }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || ggml_nbytes(t) > UINT32_MAX) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (t->nb[d] > UINT32_MAX || t->nb[d] % sizeof(float) != 0 || t->ne[d] > UINT32_MAX) {
+                return false;
+            }
+        }
+    }
+    return get_misalign_bytes(ctx, x) / sizeof(float) <= 0xFFFF &&
+           get_misalign_bytes(ctx, weight) / sizeof(float) <= 0xFF &&
+           get_misalign_bytes(ctx, dst) / sizeof(float) <= 0xFF;
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -15493,6 +15562,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_SCALE;
                 fusion_string = "RMS_NORM_SCALE";
                 std::fill_n(op_srcs_fused_elementwise, 2, true);
+            } else if (ggml_vk_can_fuse_rms_norm_mul_gate(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                ctx->fused_rms_norm_mode = RMS_NORM_MUL_GATE;
+                fusion_string = "RMS_NORM_MUL_GATE";
+                std::fill_n(op_srcs_fused_elementwise, 4, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, rms_norm_mul_add_mul_pattern)) {
                 ctx->num_additional_fused_ops = 3;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL_ADD_MUL;
@@ -15838,6 +15912,80 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return true;
     };
+    const int GATED_NORM_SEARCH = 32;
+    auto const &is_ready = [&](const ggml_tensor * t) -> bool {
+        const ggml_tensor * b = t->view_src ? t->view_src : t;
+        return b->op == GGML_OP_NONE || used_node_set.count((ggml_tensor *) b) || used_node_set.count((ggml_tensor *) t);
+    };
+    auto const &is_gate_unary = [](const ggml_tensor * t) -> bool {
+        return t->op == GGML_OP_UNARY && (ggml_get_unary_op(t) == GGML_UNARY_OP_SILU || ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID);
+    };
+    // Unused nodes {RMS_NORM r, MUL(r, w), UNARY(z), MUL(mul, unary)} of a gated norm starting at r.
+    auto const &match_gated_norm = [&](int r, int gn[4]) -> bool {
+        const ggml_tensor * rms = graph->nodes[r];
+        if (rms->op != GGML_OP_RMS_NORM || used[r]) {
+            return false;
+        }
+        int mul = -1, out = -1;
+        const int end = std::min(r + GATED_NORM_SEARCH, graph->n_nodes);
+        for (int k = r + 1; k < end; ++k) {
+            const ggml_tensor * n = graph->nodes[k];
+            if (used[k] || n->op != GGML_OP_MUL) {
+                continue;
+            }
+            if (mul < 0 && (n->src[0] == rms || n->src[1] == rms)) {
+                mul = k;
+            } else if (mul >= 0 && (n->src[0] == graph->nodes[mul] || n->src[1] == graph->nodes[mul])) {
+                out = k;
+                break;
+            }
+        }
+        if (mul < 0 || out < 0) {
+            return false;
+        }
+        const ggml_tensor * m = graph->nodes[mul];
+        const ggml_tensor * o = graph->nodes[out];
+        const ggml_tensor * g = o->src[0] == m ? o->src[1] : o->src[0];
+        if (!is_gate_unary(g)) {
+            return false;
+        }
+        for (int k = r + 1; k < out; ++k) {
+            if (graph->nodes[k] == g && !used[k]) {
+                gn[0] = r; gn[1] = mul; gn[2] = k; gn[3] = out;
+                return true;
+            }
+        }
+        return false;
+    };
+    // ... and all of its outside inputs are scheduled, so it can be emitted now.
+    auto const &find_gated_norm = [&](int r, int gn[4]) -> bool {
+        if (!match_gated_norm(r, gn)) {
+            return false;
+        }
+        const ggml_tensor * rms = graph->nodes[gn[0]];
+        const ggml_tensor * m   = graph->nodes[gn[1]];
+        const ggml_tensor * w   = m->src[0] == rms ? m->src[1] : m->src[0];
+        return is_ready(rms->src[0]) && is_ready(w) && is_ready(graph->nodes[gn[2]]->src[0]);
+    };
+    // A node of a gated norm whose RMS_NORM is not scheduled yet: leave it for find_gated_norm.
+    auto const &is_pending_gated_norm_node = [&](int j) -> bool {
+        const ggml_tensor * n = graph->nodes[j];
+        int gn[4];
+        if (n->op == GGML_OP_RMS_NORM) {
+            return match_gated_norm(j, gn);
+        }
+        if (!is_gate_unary(n) && n->op != GGML_OP_MUL) {
+            return false;
+        }
+        for (int r = std::max(first_unused, j - GATED_NORM_SEARCH); r < j; ++r) {
+            if (graph->nodes[r]->op == GGML_OP_RMS_NORM && match_gated_norm(r, gn) &&
+                (gn[1] == j || gn[2] == j || gn[3] == j)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     while (first_unused < graph->n_nodes) {
         std::vector<int> current_set;
 
@@ -15929,6 +16077,30 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rms_norm_mul_add_mul_pattern)) {
             continue;
         }
+        // Gated norm: RMS_NORM -> MUL(w) and UNARY(gate) -> MUL. The gate's producer usually sits between
+        // the norm and the gate in the graph, so find the four nodes by their edges and emit them together.
+        {
+            int gn[4];
+            if (find_gated_norm(first_unused, gn)) {
+                std::set<ggml_tensor *> seen;
+                for (int k : gn) {
+                    ggml_tensor * node = graph->nodes[k];
+                    for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                        if (node->src[s] && seen.insert(node->src[s]).second) {
+                            params->add_alloc_dep(params->user_data, node->src[s], graph->nodes[gn[3]]);
+                        }
+                    }
+                    seen.insert(node);
+                    new_order.push_back(node);
+                    used_node_set.insert(node);
+                    used[k] = true;
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    first_unused++;
+                }
+                continue;
+            }
+        }
         if (keep_pattern(rms_norm_mul_add_pattern)) {
             continue;
         }
@@ -15984,6 +16156,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_scale_mul_pattern, j) ||
                 match_pattern(rms_norm_scale_pattern, j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
+                is_pending_gated_norm_node(j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||

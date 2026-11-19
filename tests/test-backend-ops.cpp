@@ -4147,6 +4147,47 @@ struct test_rms_norm_scale : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_UNARY (SILU/SIGMOID) + GGML_OP_MUL
+struct test_rms_norm_mul_gate : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool strided;
+    const bool sigmoid;
+    const int extra_consumer;
+    const bool reverse;
+
+    test_rms_norm_mul_gate(std::array<int64_t, 4> ne, bool strided, bool sigmoid = false, int extra_consumer = 0, bool reverse = false)
+        : ne(ne), strided(strided), sigmoid(sigmoid), extra_consumer(extra_consumer), reverse(reverse) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_GATE";
+    }
+
+    std::string vars() override { return VARS_TO_STR5(ne, strided, sigmoid, extra_consumer, reverse); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * z;
+        if (strided) {
+            z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * 2 + 1, ne[1], ne[2], ne[3]);
+            z = ggml_view_4d(ctx, z, ne[0], ne[1], ne[2], ne[3], z->nb[1], z->nb[2], z->nb[3], sizeof(float));
+        } else {
+            z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
+        // Visit the inputs before the fusion pattern.
+        x = ggml_add(ctx, ggml_add(ctx, x, w), z);
+        ggml_tensor * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * gated = sigmoid ? ggml_sigmoid(ctx, z) : ggml_silu(ctx, z);
+        ggml_tensor * out = reverse ? ggml_mul(ctx, gated, normalized) : ggml_mul(ctx, normalized, gated);
+        if (extra_consumer != 0) {
+            out = ggml_add(ctx, out, ggml_sqr(ctx, extra_consumer == 1 ? normalized : gated));
+        }
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -11716,6 +11757,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_scale({128, 16, 1, 1}, view, with_mul, false, 0.0f, -0.5f));
         }
     }
+    for (const auto & ne : { std::array<int64_t, 4>{128, 32, 1, 1}, {128, 48, 1, 1}, {128, 32, 4, 1}, {67, 5, 3, 2} }) {
+        for (bool strided : {false, true}) {
+            test_cases.emplace_back(new test_rms_norm_mul_gate(ne, strided));
+            test_cases.emplace_back(new test_rms_norm_mul_gate(ne, strided, true));
+        }
+    }
+    for (int extra_consumer : {1, 2}) {
+        test_cases.emplace_back(new test_rms_norm_mul_gate({128, 32, 1, 1}, true, false, extra_consumer));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_gate({128, 32, 1, 1}, true, false, 0, true));
 
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
 
