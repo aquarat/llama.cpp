@@ -9850,9 +9850,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_RMS_NORM:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->do_add_rms_partials) {
-                return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
+                return ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_SCALE_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
             }
-            return ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm[0][ctx->fused_rms_norm_mode == RMS_NORM_MUL], src0->ne[0]);
+            return ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm[0][ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_SCALE_MUL], src0->ne[0]);
         }
         if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16 && !ctx->do_add_rms_partials) {
             return ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm[1][ctx->fused_rms_norm_mode == RMS_NORM_MUL], src0->ne[0]);
@@ -11805,7 +11805,12 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * dst;
     const ggml_tensor * src1;
 
-    if (ctx->fused_rms_norm_mode != RMS_NORM_COUNT) {
+    const bool do_scale = ctx->fused_rms_norm_mode == RMS_NORM_SCALE || ctx->fused_rms_norm_mode == RMS_NORM_SCALE_MUL;
+    if (do_scale) {
+        const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+        dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+        src1 = ctx->fused_rms_norm_mode == RMS_NORM_SCALE_MUL ? (dst->src[0] == scale ? dst->src[1] : dst->src[0]) : src0;
+    } else if (ctx->fused_rms_norm_mode != RMS_NORM_COUNT) {
         ggml_tensor * mul = cgraph->nodes[node_idx + 1];
         dst = mul;
         src1 = mul->src[0] == rms ? mul->src[1] : mul->src[0];
@@ -11816,6 +11821,9 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
 
     const uint32_t num_partials = ctx->do_add_rms_partials ? ggml_vk_rms_num_partials(ctx, dst) : 0;
     vk_op_binary_push_constants bin = ggml_vk_rms_norm_push_constants(src0, src1, dst, op_params[0], num_partials);
+    if (do_scale) {
+        bin.param2 = ggml_get_op_params_f32(cgraph->nodes[node_idx + 1], 0);
+    }
 
     if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_ROPE ||
         ctx->fused_rms_norm_mode == RMS_NORM_MUL_ROPE_VIEW_SET_ROWS) {
@@ -11899,7 +11907,7 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
     } else {
-        GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
+        GGML_ASSERT(do_scale || ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
 
@@ -14516,6 +14524,36 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_are_same_shape(scale_in->src[0], scale_out);
 }
 
+static bool ggml_vk_can_fuse_rms_norm_scale(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx, bool with_mul) {
+    const auto & pattern = with_mul ? rms_norm_scale_mul_pattern : rms_norm_scale_pattern;
+    if (!ggml_can_fuse(cgraph, node_idx, pattern)) {
+        return false;
+    }
+    const ggml_tensor * rms = cgraph->nodes[node_idx];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+    if (rms->src[0]->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 ||
+        scale->type != GGML_TYPE_F32 || scale->src[0] != rms ||
+        !ggml_is_contiguous_rows(rms->src[0]) || !ggml_is_contiguous(scale) ||
+        !ggml_are_same_shape(rms, scale) || ggml_get_op_params_f32(scale, 1) != 0.0f ||
+        get_misalign_bytes(ctx, rms->src[0]) != 0 || get_misalign_bytes(ctx, scale) != 0) {
+        return false;
+    }
+    if (with_mul) {
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+        if (mul->src[0] != scale && mul->src[1] != scale) {
+            return false;
+        }
+        const ggml_tensor * weight = mul->src[0] == scale ? mul->src[1] : mul->src[0];
+        if (mul->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(mul, scale) || !ggml_is_contiguous(mul) ||
+            !ggml_is_contiguous_rows(weight) || !ggml_can_repeat(weight, scale) ||
+            get_misalign_bytes(ctx, weight) != 0 || get_misalign_bytes(ctx, mul) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -15445,6 +15483,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_gate = true;
                 fusion_string = "HC_POST_GATE";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_rms_norm_scale(ctx, cgraph, i, true)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_rms_norm_mode = RMS_NORM_SCALE_MUL;
+                fusion_string = "RMS_NORM_SCALE_MUL";
+                std::fill_n(op_srcs_fused_elementwise, 3, true);
+            } else if (ggml_vk_can_fuse_rms_norm_scale(ctx, cgraph, i, false)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_rms_norm_mode = RMS_NORM_SCALE;
+                fusion_string = "RMS_NORM_SCALE";
+                std::fill_n(op_srcs_fused_elementwise, 2, true);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, rms_norm_mul_add_mul_pattern)) {
                 ctx->num_additional_fused_ops = 3;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL_ADD_MUL;
@@ -15875,6 +15923,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
+        if (keep_pattern(rms_norm_scale_mul_pattern) || keep_pattern(rms_norm_scale_pattern)) {
+            continue;
+        }
         if (keep_pattern(rms_norm_mul_add_mul_pattern)) {
             continue;
         }
@@ -15930,6 +15981,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(topk_moe_late_softmax, j) ||
                 match_pattern(snake_pattern, j) ||
                 in_qsa_pattern(j) ||
+                match_pattern(rms_norm_scale_mul_pattern, j) ||
+                match_pattern(rms_norm_scale_pattern, j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||

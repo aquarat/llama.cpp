@@ -59,7 +59,7 @@ void main() {
     }
 
     const FLOAT_TYPE mean = sum / FLOAT_TYPE(ncols);
-    const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
+    const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1)) * FLOAT_TYPE(p.param2);
 
     if (do_multiply) {
         if (ncols > p.ne10) {

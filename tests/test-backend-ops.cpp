@@ -4102,6 +4102,51 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_SCALE (+ GGML_OP_MUL)
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool view;
+    const bool with_mul;
+    const bool second_consumer;
+    const float bias;
+    const float factor;
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne, bool view = false, bool with_mul = false,
+                        bool second_consumer = false, float bias = 0.0f, float factor = 0.0f)
+        : ne(ne), view(view), with_mul(with_mul), second_consumer(second_consumer), bias(bias), factor(factor) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return with_mul ? "RMS_NORM_SCALE_MUL" : "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(ne, view, with_mul, second_consumer, bias, factor);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * (view ? 2 : 1), ne[1], ne[2], ne[3]);
+        ggml_tensor * weight = nullptr;
+        if (with_mul) {
+            weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        }
+        if (view) {
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+        }
+        ggml_tensor * rms = ggml_rms_norm(ctx, a, 1e-6f / ne[0]);
+        ggml_tensor * out = ggml_scale_bias(ctx, rms, factor == 0.0f ? 1.0f / sqrtf(ne[0]) : factor, bias);
+        if (with_mul) {
+            out = ggml_mul(ctx, out, weight);
+        }
+        if (second_consumer) {
+            out = ggml_add(ctx, out, ggml_sqr(ctx, rms));
+        }
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -11658,6 +11703,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f, false));
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
+    for (bool view : {false, true}) {
+        test_cases.emplace_back(new test_rms_norm_scale({128, 16, 1, 1}, view));
+        test_cases.emplace_back(new test_rms_norm_scale({128, 16, 3, 1}, view));
+        test_cases.emplace_back(new test_rms_norm_scale({67, 16, 1, 1}, view));
+        test_cases.emplace_back(new test_rms_norm_scale({4097, 2, 1, 1}, view));
+        for (bool with_mul : {false, true}) {
+            test_cases.emplace_back(new test_rms_norm_scale({2816, 1, 1, 1}, view, with_mul));
+            test_cases.emplace_back(new test_rms_norm_scale({2816, 5, 1, 1}, view, with_mul));
+            test_cases.emplace_back(new test_rms_norm_scale({128, 16, 1, 1}, view, with_mul, true));
+            test_cases.emplace_back(new test_rms_norm_scale({128, 16, 1, 1}, view, with_mul, false, 0.25f));
+            test_cases.emplace_back(new test_rms_norm_scale({128, 16, 1, 1}, view, with_mul, false, 0.0f, -0.5f));
+        }
+    }
+
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
 
     for (uint32_t n : {1, 127, 129, 511, 513, 2816, 4096, 16385}) {

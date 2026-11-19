@@ -557,6 +557,8 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
+static constexpr std::initializer_list<ggml_op> rms_norm_scale_pattern       { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+static constexpr std::initializer_list<ggml_op> rms_norm_scale_mul_pattern   { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL };
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
@@ -645,6 +647,8 @@ enum topk_moe_mode {
 };
 
 enum rms_norm_mode {
+    RMS_NORM_SCALE,
+    RMS_NORM_SCALE_MUL,
     RMS_NORM_MUL,
     RMS_NORM_MUL_ADD,
     RMS_NORM_MUL_ADD_MUL,
