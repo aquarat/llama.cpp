@@ -326,6 +326,9 @@ struct server_slot {
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
+    // tokens of the generation prompt of a chat task, the near-end checkpoints are made before them
+    int32_t n_generation_prompt = 0;
+
     size_t last_nl_pos = 0;
 
     common_chat_input generated;
@@ -2046,6 +2049,9 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        const auto & generation_prompt = task.params.sampling.generation_prompt;
+        slot.n_generation_prompt = generation_prompt.empty() ? 0 : common_tokenize(vocab, generation_prompt, false, true).size();
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -4455,15 +4461,15 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 4
+                        //  - 4 + generation prompt tokens + n_ubatch
+                        //  - 4 + generation prompt tokens
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets[] = {4 + slot.n_generation_prompt + n_ubatch, 4 + slot.n_generation_prompt};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
+                                const int n_last = std::min(n_batch + slot.n_generation_prompt, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
                                     break;
@@ -4480,7 +4486,7 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch + slot.n_generation_prompt;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;

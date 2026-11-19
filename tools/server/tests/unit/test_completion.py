@@ -813,6 +813,66 @@ def test_completion_checkpoint_kept_after_restore():
         assert cache_n(prefix + suffix) == len(prefix) - 1
 
 
+# the last near-end checkpoint must be before the generation prompt, the next request often renders it differently
+@pytest.mark.parametrize("n_batch,n_ubatch", [(4, 4), (32, 16)])
+def test_completion_checkpoint_before_generation_prompt(n_batch, n_ubatch):
+    global server
+    server = ServerPreset.tinylfm3omni()
+    server.jinja = True
+    server.n_slots = 1
+    server.n_batch = n_batch
+    server.n_ubatch = n_ubatch
+    server.cache_ram = 0
+    server.temperature = 0.0
+    server.start()
+
+    messages = [{"role": "user", "content": "Purple elephants quietly compose sonnets about tax law. " * 8}]
+
+    def render(add_generation_prompt):
+        res = server.make_request("POST", "/apply-template", data={
+            "messages": messages,
+            "add_generation_prompt": add_generation_prompt,
+        })
+        assert res.status_code == 200
+        return res.body["prompt"]
+
+    def tokenize(content, add_special=False):
+        res = server.make_request("POST", "/tokenize", data={
+            "content": content,
+            "add_special": add_special,
+            "parse_special": True,
+        })
+        assert res.status_code == 200
+        return res.body["tokens"]
+
+    prompt = render(True)
+    without_generation = render(False)
+    assert prompt.startswith(without_generation)
+    n_gen = len(tokenize(prompt[len(without_generation):]))
+    assert n_gen >= 2
+    tokens = tokenize(prompt, add_special=True)
+
+    res = server.make_request("POST", "/v1/chat/completions", data={
+        "messages": messages,
+        "max_tokens": 4,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["usage"]["prompt_tokens"] == len(tokens)
+
+    # Drop the template tail and four preceding tokens, so the old last checkpoint is invalid.
+    prefix = tokens[:-(4 + n_gen)]
+    suffix = tokenize("Seven tiny robots repaired the broken lighthouse lens before the storm arrived.")
+    assert suffix[0] != tokens[len(prefix)]
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prefix + suffix,
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] == len(prefix)
+
+
 # hybrid model with SWA: a checkpoint or a state right before the new tokens must be reused, even if it is less than n_swa tokens away
 def test_completion_checkpoint_hybrid_swa():
     global server
