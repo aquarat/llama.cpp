@@ -16354,7 +16354,36 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        const int NUM_TO_CHECK = 96;
+        // Do not pull a node away from the next node it fuses with (e.g. MUL_MAT_ID + MUL,
+        // UNARY + MUL) while that node still has unscheduled inputs.
+        auto const &fusion_partner_waits = [&](int j) -> bool {
+            if (j + 1 >= graph->n_nodes || used[j + 1]) {
+                return false;
+            }
+            const ggml_tensor * a = graph->nodes[j];
+            const ggml_tensor * b = graph->nodes[j + 1];
+            const bool pair = (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_ADD) ||
+                              (a->op == GGML_OP_MUL_MAT_ID && (b->op == GGML_OP_ADD_ID || b->op == GGML_OP_MUL)) ||
+                              (a->op == GGML_OP_RMS_NORM   && b->op == GGML_OP_MUL) ||
+                              (a->op == GGML_OP_UNARY      && b->op == GGML_OP_MUL) ||
+                              (a->op == GGML_OP_SSM_CONV   && (b->op == GGML_OP_ADD || b->op == GGML_OP_UNARY));
+            if (!pair || (b->src[0] != a && b->src[1] != a)) {
+                return false;
+            }
+            for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = b->src[s];
+                if (!src || src == a) {
+                    continue;
+                }
+                const ggml_tensor * base = src->view_src ? src->view_src : src;
+                if (base->op != GGML_OP_NONE && used_node_set.find((ggml_tensor *) base) == used_node_set.end() &&
+                    used_node_set.find((ggml_tensor *) src) == used_node_set.end()) {
+                    return true;
+                }
+            }
+            return false;
+        };
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
@@ -16370,6 +16399,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (has_conv) {
                     continue;
                 }
+            }
+            if (fusion_partner_waits(j)) {
+                continue;
             }
             // Protect every interior QSA node (not just the start): the mask branch is
             // independent, so it gets pulled out and breaks keep_pattern otherwise.
