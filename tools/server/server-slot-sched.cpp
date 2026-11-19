@@ -405,6 +405,12 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             if (f_keep < 0.5f) {
                 update_cache = true;
             }
+
+            // save checkpoints before a different conversation overwrites them
+            const auto lcp_len = ret->prompt->tokens.get_common_prefix(task.tokens);
+            if (!ret->prompt->checkpoints.empty() && lcp_len < ret->prompt->checkpoints.back()->n_tokens) {
+                update_cache = true;
+            }
         }
     }
 

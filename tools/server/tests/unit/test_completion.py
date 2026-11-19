@@ -813,6 +813,38 @@ def test_completion_checkpoint_kept_after_restore():
         assert cache_n(prefix + suffix) == len(prefix) - 1
 
 
+# a slot whose newest checkpoint would be lost to another prompt must be saved to the prompt cache, even if f_keep >= 0.5
+@pytest.mark.parametrize("id_slot", [-1, 0])
+def test_completion_checkpoint_before_overwrite(id_slot):
+    global server
+    server = ServerPreset.tinylfm3omni()
+    server.n_slots = 1
+    server.n_batch = 16
+    server.n_ubatch = 16
+    server.cache_ram = 64
+    server.temperature = 0.0
+    server.start()
+
+    def cache_n(prompt):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "id_slot": id_slot,
+            "n_predict": 1,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        return res.body["timings"]["cache_n"]
+
+    prefix = [1000 + i for i in range(128)]
+    prompt_a = prefix + [5000 + i for i in range(64)]
+    prompt_b = prefix + [6000 + i for i in range(64)]
+
+    # the shared prefix keeps more than half the slot, but drops its newest checkpoint
+    assert cache_n(prompt_a) == 0
+    cache_n(prompt_b)
+    assert cache_n(prompt_a + [7000]) >= len(prompt_a) - 4
+
+
 # hybrid model with SWA: a checkpoint or a state right before the new tokens must be reused, even if it is less than n_swa tokens away
 def test_completion_checkpoint_hybrid_swa():
     global server
