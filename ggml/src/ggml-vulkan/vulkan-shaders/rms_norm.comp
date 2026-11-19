@@ -39,6 +39,10 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 #define GGML_ROPE_TYPE_MROPE  8
 #define GGML_ROPE_TYPE_VISION 24
 
+#elif RMS_NORM_GATE_FUSION
+
+layout (binding = 3) readonly buffer Z {float data_z[];};
+
 #elif RMS_NORM_ADD_FUSION
 
 layout (binding = 3) readonly buffer C {C_TYPE data_c[];};
@@ -56,6 +60,15 @@ layout (constant_id = 2) const bool do_post_multiply = false;
 #endif
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+
+#if RMS_NORM_GATE_FUSION
+float gate(uint col, uint row, uint channel, uint samp) {
+    // Destination strides and ne20 carry the gate strides and offset.
+    float z = data_z[p.ne20 + col*p.nb20 + row*p.nb21 + channel*p.nb22 + samp*p.nb23];
+    float sigmoid = 1.0f / (1.0f + exp(-z));
+    return p.param3 != 0 ? sigmoid : z * sigmoid;
+}
+#endif
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -138,6 +151,9 @@ void rms_norm(uint num_iters) {
                             continue;
                         }
                         FLOAT_TYPE value = scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])) * FLOAT_TYPE(B_TO_FLOAT(data_b[b_offset + fastmod(col, p.ne10)]));
+#if RMS_NORM_GATE_FUSION
+                        value *= gate(col, row, channel, samp);
+#endif
 #if RMS_NORM_ADD_FUSION
                         value += FLOAT_TYPE(C_TO_FLOAT(data_c[d_offset + col]));
                         if (do_post_multiply) {
@@ -152,6 +168,9 @@ void rms_norm(uint num_iters) {
                             continue;
                         }
                         FLOAT_TYPE value = scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])) * FLOAT_TYPE(B_TO_FLOAT(data_b[b_offset + col]));
+#if RMS_NORM_GATE_FUSION
+                        value *= gate(col, row, channel, samp);
+#endif
 #if RMS_NORM_ADD_FUSION
                         value += FLOAT_TYPE(C_TO_FLOAT(data_c[d_offset + col]));
                         if (do_post_multiply) {

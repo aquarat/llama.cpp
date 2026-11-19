@@ -558,6 +558,7 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+static constexpr std::initializer_list<ggml_op> rms_norm_mul_gate_pattern    { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
@@ -646,6 +647,7 @@ enum topk_moe_mode {
 
 enum rms_norm_mode {
     RMS_NORM_MUL,
+    RMS_NORM_MUL_GATE,
     RMS_NORM_MUL_ADD,
     RMS_NORM_MUL_ADD_MUL,
     RMS_NORM_MUL_ROPE,
@@ -896,6 +898,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     // [src/dst 0=fp32,1=bf16][mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm[2][2];
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_gate;
     // [src/dst 0=fp32,1=bf16][residual 0=fp32,1=bf16][post mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add[2][2][2];
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
