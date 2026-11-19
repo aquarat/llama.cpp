@@ -1,0 +1,54 @@
+#version 450
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint TOKENS_PER_WG = 4;
+layout(constant_id = 2) const bool APPLY_BIAS = false;
+layout(constant_id = 3) const bool APPLY_SILU = false;
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer State { float state[]; };
+layout(binding = 1) readonly buffer Input { float input_data[]; };
+layout(binding = 2) readonly buffer Kernel { float kernel[]; };
+layout(binding = 3) readonly buffer Bias { float bias[]; };
+layout(binding = 4) writeonly buffer Concat { float concat_data[]; };
+layout(binding = 5) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint state_nb1; uint state_nb2;
+    uint input_nb0; uint input_nb1; uint input_nb2;
+    uint channels; uint tokens; uint seqs;
+};
+
+float load_input(uint t, uint c, uint s) {
+    return t < 3 ? state[s * state_nb2 + c * state_nb1 + t]
+                 : input_data[s * input_nb2 + c * input_nb1 + (t - 3) * input_nb0];
+}
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_GlobalInvocationID.y;
+    const uint s = gl_GlobalInvocationID.z;
+    if (c >= channels || t >= tokens || s >= seqs) {
+        return;
+    }
+
+    const vec4 x = vec4(load_input(t, c, s), load_input(t + 1, c, s),
+                        load_input(t + 2, c, s), load_input(t + 3, c, s));
+    float sum = dot(x, vec4(kernel[4 * c], kernel[4 * c + 1], kernel[4 * c + 2], kernel[4 * c + 3]));
+    if (APPLY_BIAS) {
+        sum += bias[c];
+    }
+    if (APPLY_SILU) {
+        sum /= 1.0 + exp(-sum);
+    }
+    dst[(s * tokens + t) * channels + c] = sum;
+
+    // Each invocation owns one new token; the first also writes the old state.
+    const uint base = (s * channels + c) * (tokens + 3);
+    concat_data[base + t + 3] = input_data[s * input_nb2 + c * input_nb1 + t * input_nb0];
+    if (t == 0) {
+        concat_data[base] = x.x;
+        concat_data[base + 1] = x.y;
+        concat_data[base + 2] = x.z;
+    }
+}
