@@ -865,3 +865,45 @@ def test_completion_checkpoint_hybrid_swa():
     assert actual["timings"]["cache_n"] == len(prefix) + len(first["tokens"]) - 1
     assert actual["timings"]["prompt_n"] == len(suffix) + 1
     assert_same_output(actual, expected)
+
+
+# a prompt cache entry must be kept with fewer checkpoints instead of dropping it, or another entry, when the size limit is hit
+@pytest.mark.parametrize("n_prompt_b", [20, 400])
+def test_completion_checkpoint_cache_ram(monkeypatch, tmp_path, n_prompt_b):
+    global server
+    server = ServerPreset.tinylfm3omni()
+    server.n_slots = 1
+    server.n_batch = 16
+    server.n_ubatch = 16
+    server.cache_ram = 1
+    server.debug = True
+    server.log_path = str(tmp_path / "server.log")
+    monkeypatch.setenv("LLAMA_ARG_CTX_CHECKPOINTS", "32")
+    monkeypatch.setenv("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT", "0")
+    server.start()
+
+    def complete(prompt):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "n_predict": 4,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        return res.body
+
+    prefix = [1000 + i for i in range(400)]
+    # Each continuation adds checkpoints near the prompt end.
+    for n in range(256, len(prefix) + 1, 16):
+        complete(prefix[:n])
+    prefix_b = [5000 + i for i in range(n_prompt_b)]
+    for n in range(min(256, n_prompt_b), n_prompt_b + 1, 16):
+        complete(prefix_b[:n])
+    actual = complete(prefix + [2000, 2001])
+    assert actual["timings"]["cache_n"] == len(prefix) - 4
+
+    actual = complete(prefix_b + [6000, 6001])
+    assert actual["timings"]["cache_n"] == len(prefix_b) - 4
+
+    server.stop()
+    with open(server.log_path, "rb") as f:
+        assert b"__TEST_TAG_PROMPT_CACHE_RESTORE__" in f.read()
