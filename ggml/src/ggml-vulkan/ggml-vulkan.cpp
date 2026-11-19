@@ -15233,19 +15233,30 @@ bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const str
 
     const int mode = ((const int32_t *) rope->op_params)[2];
 
-    if (rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+    const ggml_tensor * src = rms->src[0];
+    const ggml_tensor * weight = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    if (src->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 ||
+        weight->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) {
         return false;
     }
 
-    // noncontig tensors aren't tested, and don't seem common in practice
+    // Input rows may be strided, but each row must be contiguous.
+    if (!ggml_is_contiguous_rows(src) || !ggml_is_contiguous_rows(weight) ||
+        !ggml_are_same_shape(rms, mul) ||
+        get_misalign_bytes(ctx, src) != 0 || get_misalign_bytes(ctx, weight) != 0 ||
+        get_misalign_bytes(ctx, rope->src[1]) != 0 ||
+        (rope->src[2] && get_misalign_bytes(ctx, rope->src[2]) != 0)) {
+        return false;
+    }
+
     if (!ggml_is_contiguous(rms) ||
         !ggml_is_contiguous(mul) ||
         !ggml_is_contiguous(rope)) {
         return false;
     }
 
-    // only norm/neox are handled in the shader
-    if (mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_NORMAL) {
+    if (mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_NORMAL &&
+        mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE) {
         return false;
     }
 

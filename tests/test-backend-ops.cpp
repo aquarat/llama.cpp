@@ -2976,6 +2976,9 @@ struct test_rms_norm_mul_rope : public test_case {
     const bool yarn;
     const bool truncate;
     const ggml_type type; // type of a, the weights are F32
+    const bool strided;
+    const bool extra_consumer;
+    const int rope_dims;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -2989,18 +2992,24 @@ struct test_rms_norm_mul_rope : public test_case {
         if (type != GGML_TYPE_F32) {
             s += "," + VAR_TO_STR(type);
         }
+        s += "," + VARS_TO_STR3(strided, extra_consumer, rope_dims);
         return s;
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
                            bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
                            bool mul = true, bool rope = true, ggml_type set_rows_type = GGML_TYPE_F16,
-                           bool yarn = false, bool truncate = true, ggml_type type = GGML_TYPE_F32)
+                           bool yarn = false, bool truncate = true, ggml_type type = GGML_TYPE_F32,
+                           bool strided = false, bool extra_consumer = false, int rope_dims = 0)
         : ne(ne), eps(eps), multi_add(multi_add), mul(mul), rope(rope), set_rows(set_rows), broadcast(broadcast),
-          set_rows_type(set_rows_type), mode(mode), yarn(yarn), truncate(truncate), type(type) {}
+          set_rows_type(set_rows_type), mode(mode), yarn(yarn), truncate(truncate), type(type),
+          strided(strided), extra_consumer(extra_consumer), rope_dims(rope_dims) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0] * (strided ? 2 : 1), ne[1], ne[2], ne[3]);
+        if (strided) {
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+        }
 
         ggml_tensor * b = nullptr;
         ggml_tensor * c = nullptr;
@@ -3025,6 +3034,7 @@ struct test_rms_norm_mul_rope : public test_case {
         if (mul) {
             a = ggml_mul(ctx, a, w);
         }
+        ggml_tensor * intermediate = a;
 
         if (rope) {
             const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
@@ -3035,8 +3045,8 @@ struct test_rms_norm_mul_rope : public test_case {
             const float ext_factor = yarn ? 1.0f : 0.0f;
 
             if (is_mrope) {
-                const int n_dims = ne[0];
-                int sections[4] = { n_dims/3, n_dims/3, n_dims/3, 0 };
+                const int n_dims = rope_dims ? rope_dims : ne[0];
+                int sections[4] = { n_dims/8, n_dims/8, n_dims/8, n_dims/2 - 3*(n_dims/8) };
                 a = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, 1.0f, 32.0f, 1.0f);
             } else if (yarn) {
                 a = ggml_rope_ext(ctx, a, pos, nullptr, ne[0], mode, n_ctx_orig, freq_base, freq_scale, ext_factor, 1.0f, 32.0f, 1.0f);
@@ -3056,6 +3066,10 @@ struct test_rms_norm_mul_rope : public test_case {
             ggml_set_name(row_idxs, "row_idxs");
 
             a = ggml_set_rows(ctx, dst, view, row_idxs);
+        }
+
+        if (extra_consumer) {
+            a = ggml_add(ctx, a, ggml_sum(ctx, intermediate));
         }
 
         ggml_set_name(a, "out");
@@ -11845,6 +11859,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, { 1536, 1, 1, 1 }, 1e-6f, false, false, true, false, false, GGML_TYPE_F32, GGML_TYPE_BF16));
     // the ADD operand is the BF16 input itself, added in place
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true, false, GGML_TYPE_F32));
+
+    for (int mode : { GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE }) {
+        for (int64_t n_tokens : { 1, 3 }) {
+            for (int64_t n_heads : { 2, 16 }) {
+                for (bool strided : { false, true }) {
+                    for (bool set_rows : { false, true }) {
+                        test_cases.emplace_back(new test_rms_norm_mul_rope({256, n_heads, n_tokens, 1}, 1e-6f, false, set_rows, true, mode, true, true, GGML_TYPE_F16, false, true, GGML_TYPE_F32, strided, false, 64));
+                    }
+                }
+            }
+        }
+        for (bool set_rows : { false, true }) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope({258, 3, 3, 1}, 1e-6f, false, set_rows, true, mode, true, true, GGML_TYPE_F32, true, false, GGML_TYPE_F32, true));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, 2, 3, 1}, 1e-6f, false, set_rows, true, mode, true, true, GGML_TYPE_F32, false, true, GGML_TYPE_F32, true, true, 64));
+        }
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
