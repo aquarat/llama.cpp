@@ -98,12 +98,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size += ckpt->size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    if (limit_size > 0 && state_size_tgt + state_size_dft > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+                (state_size_tgt + state_size_dft) / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return nullptr;
     }
 
@@ -120,7 +120,31 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    auto checkpoints = prompt.checkpoints;
     if (limit_size > 0) {
+        size_t size_total = size() + state_size_new;
+        // drop the oldest checkpoints of an entry before dropping whole entries, keep the newest n_keep
+        auto trim_checkpoints = [&](auto & ckpts, size_t n_keep) {
+            const size_t n_before = ckpts.size();
+            const size_t size_before = size_total;
+            while (size_total > limit_size && ckpts.size() > n_keep) {
+                size_total -= ckpts.front()->size();
+                ckpts.pop_front();
+            }
+            if (ckpts.size() < n_before) {
+                SRV_WRN(" - dropped %zu oldest checkpoints to fit prompt cache size limit %.3f MiB\n",
+                        n_before - ckpts.size(), limit_size / (1024.0 * 1024.0));
+            }
+            return size_before - size_total;
+        };
+
+        for (auto & state : states) {
+            trim_checkpoints(state.prompt.checkpoints, 1);
+        }
+
+        const size_t n_keep = !checkpoints.empty() && state_size_tgt + state_size_dft + checkpoints.back()->size() <= limit_size ? 1 : 0;
+        state_size_new -= trim_checkpoints(checkpoints, n_keep);
+
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
@@ -152,7 +176,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(checkpoints),
             /*.lora        =*/ prompt.lora,
         },
         /*.data   =*/ {
